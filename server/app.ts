@@ -1,0 +1,251 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import bcrypt from 'bcryptjs';
+
+type Source = 'Admin' | 'Bot';
+type Session = { adminId: string; username: string };
+const app = express();
+const rateDefault = 1;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseSecretKey = process.env.SUPABASE_SECRET_KEY;
+const supabase: SupabaseClient | null = supabaseUrl && supabaseSecretKey
+  ? createClient(supabaseUrl, supabaseSecretKey, { auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false } })
+  : null;
+
+app.use(cors());
+app.use(express.json({ limit: '8mb' }));
+
+function db(res: express.Response): SupabaseClient | null {
+  if (!supabase) res.status(503).json({ error: 'Supabase is not configured. Add SUPABASE_URL and SUPABASE_SECRET_KEY to .env, then restart the server.' });
+  return supabase;
+}
+
+async function currentAdmin(req: express.Request): Promise<Session | null> {
+  const token = req.header('authorization')?.replace(/^Bearer\s+/i, '');
+  if (!token || !supabase || !supabaseSecretKey) return null;
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+  const expected = createHmac('sha256', supabaseSecretKey).update(payload).digest();
+  let supplied: Buffer;
+  try { supplied = Buffer.from(signature, 'base64url'); } catch { return null; }
+  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return null;
+  let claims: { adminId: string; username: string; expiresAt: number };
+  try { claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); } catch { return null; }
+  if (!claims.adminId || !claims.username || claims.expiresAt <= Date.now()) return null;
+  const { data, error } = await supabase.from('admins').select('id, username, is_active').eq('id', claims.adminId).eq('username', claims.username).maybeSingle();
+  if (error || !data?.is_active) return null;
+  return { adminId: String(data.id), username: String(data.username) };
+}
+
+function createSessionToken(admin: Session): string {
+  if (!supabaseSecretKey) throw new Error('Supabase secret key is not configured.');
+  const payload = Buffer.from(JSON.stringify({ ...admin, expiresAt: Date.now() + 8 * 60 * 60 * 1000 })).toString('base64url');
+  const signature = createHmac('sha256', supabaseSecretKey).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function reportFromRow(row: any, rate: number) {
+  const gold = row.gold_price === null ? null : Number(row.gold_price);
+  const baht = row.baht_price === null ? null : Number(row.baht_price);
+  const goldEntered = gold !== null;
+  const bahtEntered = baht !== null;
+  return {
+    id: String(row.id),
+    gold: gold ?? (baht! * 1000 / rate),
+    baht: baht ?? (gold! * rate / 1000),
+    goldEntered,
+    bahtEntered,
+    submittedAt: new Date(row.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }),
+    source: String(row.source).toLowerCase() === 'bot' ? 'Bot' as const : 'Admin' as const,
+  };
+}
+
+async function getRate(client: SupabaseClient): Promise<number> {
+  const { data, error } = await client.from('market_settings').select('baht_per_1000_gold').order('updated_at', { ascending: false }).limit(1).maybeSingle();
+  if (error) throw error;
+  const value = Number(data?.baht_per_1000_gold);
+  return Number.isFinite(value) && value > 0 ? value : rateDefault;
+}
+
+function sendDbError(res: express.Response, error: unknown) {
+  console.error('Supabase request failed:', error);
+  res.status(500).json({ error: 'Database request failed. Check the Supabase table names, columns, and permissions.' });
+}
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'TailsTopia Market', databaseConfigured: !!supabase }));
+
+app.get('/api/listings', async (_req, res) => {
+  const client = db(res); if (!client) return;
+  try {
+    const [itemResult, reportResult, rate] = await Promise.all([
+      client.from('item').select('id, name, category, description, image_path, created_at, updated_at').order('name'),
+      client.from('price_reports').select('id, item_id, source, gold_price, baht_price, status, created_at'),
+      getRate(client),
+    ]);
+    if (itemResult.error) throw itemResult.error;
+    if (reportResult.error) throw reportResult.error;
+    const reports = reportResult.data ?? [];
+    res.json((itemResult.data ?? []).map((item: any) => {
+      const related = reports.filter((row: any) => String(row.item_id) === String(item.id));
+      return {
+        id: String(item.id), name: item.name, category: item.category || 'Other',
+        image: item.image_path || '', description: item.description || item.name,
+        reports: related.filter((row: any) => row.status === 'approved').map((row: any) => reportFromRow(row, rate)),
+        pending: related.filter((row: any) => row.status === 'pending').map((row: any) => reportFromRow(row, rate)),
+      };
+    }));
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.get('/api/settings', async (_req, res) => {
+  const client = db(res); if (!client) return;
+  try { res.json({ bahtPer1000Gold: await getRate(client) }); }
+  catch (error) { sendDbError(res, error); }
+});
+
+app.put('/api/settings/rate', async (req, res) => {
+  const client = db(res); if (!client) return;
+  const admin = await currentAdmin(req); if (!admin) return res.status(401).json({ error: 'Admin login required.' });
+  const value = Number(req.body?.bahtPer1000Gold);
+  if (!Number.isFinite(value) || value <= 0) return res.status(400).json({ error: 'Enter a positive conversion rate.' });
+  try {
+    const { data: latest, error: findError } = await client.from('market_settings').select('id').order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    if (findError) throw findError;
+    const query = latest
+      ? client.from('market_settings').update({ baht_per_1000_gold: value, updated_by: admin.adminId, updated_at: new Date().toISOString() }).eq('id', latest.id)
+      : client.from('market_settings').insert({ baht_per_1000_gold: value, updated_by: admin.adminId });
+    const { error } = await query; if (error) throw error;
+    res.json({ ok: true, bahtPer1000Gold: value });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.post('/api/uploads/image', async (req, res) => {
+  const client = db(res); if (!client) return;
+  if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
+  const dataUrl = String(req.body?.dataUrl || '');
+  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return res.status(400).json({ error: 'Choose a PNG, JPG, WEBP, or GIF image.' });
+  const bytes = Buffer.from(match[2], 'base64');
+  if (!bytes.length || bytes.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'Image must be smaller than 5 MB.' });
+  const extension = match[1] === 'image/jpeg' ? 'jpg' : match[1].split('/')[1];
+  const filename = `${randomBytes(12).toString('hex')}.${extension}`;
+  try {
+    const { error } = await client.storage.from('item-images').upload(filename, bytes, { contentType: match[1], upsert: false });
+    if (error) throw error;
+    const { data } = client.storage.from('item-images').getPublicUrl(filename);
+    res.status(201).json({ url: data.publicUrl });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.put('/api/items/:itemId', async (req, res) => {
+  const client = db(res); if (!client) return;
+  if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
+  const { name, category, image, description } = req.body ?? {};
+  if (!String(name || '').trim() || !String(category || '').trim()) return res.status(400).json({ error: 'Item name and category are required.' });
+  if (typeof image !== 'string' || !image.trim()) return res.status(400).json({ error: 'Upload an item image before saving.' });
+  try {
+    const { data, error } = await client.from('item').update({ name: String(name).trim(), category: String(category).trim(), image_path: image.trim(), description: String(description || '').trim() || String(name).trim(), updated_at: new Date().toISOString() }).eq('id', req.params.itemId).select('id, name, category, description, image_path').single();
+    if (error) throw error;
+    res.json({ ok: true, item: { id: String(data.id), name: data.name, category: data.category, description: data.description, image: data.image_path, reports: [], pending: [] } });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const client = db(res); if (!client) return;
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+  if (!username || !password) return res.status(400).json({ error: 'Enter a username and password.' });
+  try {
+    const { data, error } = await client.from('admins').select('id, username, password_hash, is_active').eq('username', username).maybeSingle();
+    if (error) throw error;
+    if (!data || !data.is_active || !(await bcrypt.compare(password, data.password_hash))) return res.status(401).json({ error: 'Username or password is incorrect.' });
+    const token = createSessionToken({ adminId: String(data.id), username: String(data.username) });
+    res.json({ ok: true, token, username: data.username });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  // Tokens expire after eight hours; the client drops its token on sign out.
+  res.json({ ok: true });
+});
+
+async function findOrCreateItem(client: SupabaseClient, itemId: unknown, name: string, category: string, image: string, description: string) {
+  if (itemId !== undefined && itemId !== null && String(itemId).trim()) {
+    const { data, error } = await client.from('item').select('id, name, category, image_path, description').eq('id', String(itemId)).maybeSingle();
+    if (error) throw error;
+    if (data) return data;
+  }
+  const { data: existing, error: findError } = await client.from('item').select('id, name, category, image_path, description').ilike('name', name).maybeSingle();
+  if (findError) throw findError;
+  if (existing) return existing;
+  const { data, error } = await client.from('item').insert({ name, category: category || 'Other', image_path: image || '', description: description || name }).select('id, name, category, image_path, description').single();
+  if (error) throw error;
+  return data;
+}
+
+async function insertPending(client: SupabaseClient, itemId: number | string, source: Source, gold: number | null, baht: number | null, createdBy: string | null) {
+  const { data, error } = await client.from('price_reports').insert({ item_id: itemId, source: source.toLowerCase(), gold_price: gold, baht_price: baht, status: 'pending', created_by: createdBy }).select('id').single();
+  if (error) throw error;
+  return String(data.id);
+}
+
+app.post('/api/submissions', async (req, res) => {
+  const client = db(res); if (!client) return;
+  const admin = await currentAdmin(req); if (!admin) return res.status(401).json({ error: 'Admin login required.' });
+  const { itemId, category = 'Other', image = '', description = '', gold: rawGold, baht: rawBaht } = req.body ?? {};
+  const itemName = String(req.body?.itemName || req.body?.name || '').trim();
+  const gold = rawGold === '' || rawGold === null || rawGold === undefined ? null : Number(rawGold);
+  const baht = rawBaht === '' || rawBaht === null || rawBaht === undefined ? null : Number(rawBaht);
+  if (!itemName) return res.status(400).json({ error: 'Enter an item name.' });
+  if ((gold === null && baht === null) || [gold, baht].some(value => value !== null && (!Number.isFinite(value) || value <= 0))) return res.status(400).json({ error: 'Enter a positive gold or baht price.' });
+  try {
+    const item = await findOrCreateItem(client, itemId, itemName, String(category), String(image), String(description));
+    const reportId = await insertPending(client, item.id, 'Admin', gold, baht, admin.adminId);
+    res.status(202).json({ accepted: true, pending: true, itemId: String(item.id), reportId });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.post('/api/listings/intake', async (req, res) => {
+  const client = db(res); if (!client) return;
+  const secret = process.env.DISCORD_BOT_SECRET;
+  if (!secret || req.header('authorization') !== `Bearer ${secret}`) return res.status(401).json({ error: 'Discord bot authentication required.' });
+  const { itemName: rawName, name, category, image, description } = req.body ?? {};
+  const itemName = String(rawName || name || '').trim();
+  const rawGold = req.body?.gold ?? req.body?.goldPrice;
+  const rawBaht = req.body?.baht ?? req.body?.cashPrice;
+  const gold = Array.isArray(rawGold) ? Number(rawGold[0]) : rawGold == null || rawGold === '' ? null : Number(rawGold);
+  const baht = Array.isArray(rawBaht) ? Number(rawBaht[0]) : rawBaht == null || rawBaht === '' ? null : Number(rawBaht);
+  if (!itemName || (gold === null && baht === null) || [gold, baht].some(value => value !== null && (!Number.isFinite(value) || value <= 0))) return res.status(400).json({ error: 'Expected an item name and positive gold and/or baht price.' });
+  try {
+    const item = await findOrCreateItem(client, null, itemName, String(category || 'Other'), String(image || ''), String(description || itemName));
+    const reportId = await insertPending(client, item.id, 'Bot', gold, baht, null);
+    res.status(202).json({ accepted: true, status: 'pending', itemId: String(item.id), reportId });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.post('/api/review/:itemId', async (req, res) => {
+  const client = db(res); if (!client) return;
+  const admin = await currentAdmin(req); if (!admin) return res.status(401).json({ error: 'Admin login required.' });
+  const { decision, reportId, source } = req.body ?? {};
+  if (decision !== 'approve' && decision !== 'reject') return res.status(400).json({ error: 'Decision must be approve or reject.' });
+  try {
+    let query = client.from('price_reports').select('id').eq('item_id', req.params.itemId).eq('status', 'pending');
+    if (source === 'Admin' || source === 'Bot') query = query.eq('source', source.toLowerCase());
+    if (reportId) query = query.eq('id', reportId);
+    const { data: pending, error: findError } = await query;
+    if (findError) throw findError;
+    if (!pending?.length) return res.status(400).json({ error: 'No pending submissions in this queue.' });
+    const ids = pending.map((row: any) => row.id);
+    const update = decision === 'approve'
+      ? { status: 'approved', reviewed_by: admin.adminId, reviewed_at: new Date().toISOString() }
+      : { status: 'rejected', reviewed_by: admin.adminId, reviewed_at: new Date().toISOString() };
+    const { error } = await client.from('price_reports').update(update).in('id', ids);
+    if (error) throw error;
+    res.json({ ok: true, [decision === 'approve' ? 'approved' : 'rejected']: ids.length });
+  } catch (error) { sendDbError(res, error); }
+});
+
+export { app };

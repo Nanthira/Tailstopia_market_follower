@@ -13,6 +13,12 @@ A TypeScript, React, and Node.js site for browsing item prices and moderating re
 
 `SUPABASE_SECRET_KEY` is used only by the Express backend for database and Storage requests. Never add it to React/Vite variables, browser code, screenshots, or GitHub. The keys in `.env` are ignored by Git. The app uses `@supabase/supabase-js` because this Express backend handles its own username/password sessions; `@supabase/server` is intended for request-scoped Supabase JWT authentication in supported runtimes.
 
+## Deploy from GitHub to Netlify
+
+The repository includes `netlify.toml` and an Express Netlify Function for the `/api/*` routes. In Netlify, choose **Add new project → Import an existing project**, select this GitHub repository, and keep the build command as `npm run build` and publish directory as `dist` (both are set in `netlify.toml`). In **Project configuration → Environment variables**, add `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and `DISCORD_BOT_SECRET`; make sure the variables are available to Functions, then trigger a deploy. Netlify builds do not read `.env` from Git, so enter the values in Netlify's UI. With continuous deployment enabled, later GitHub pushes trigger a new deploy.
+
+Do not create a `VITE_` or `NEXT_PUBLIC_` version of `SUPABASE_SECRET_KEY`. The publishable key and JWKS URL are not currently needed by this server-side API. Locally, use `.env`; on Netlify, set the same server values in the Netlify environment-variable settings.
+
 ## Tables used
 
 - `item`: `id`, `name`, `category`, `description`, `image_path`, `created_at`, `updated_at`
