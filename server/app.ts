@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import bcrypt from 'bcryptjs';
 
@@ -191,7 +191,7 @@ async function findOrCreateItem(client: SupabaseClient, itemId: unknown, name: s
 }
 
 async function insertPending(client: SupabaseClient, itemId: number | string, source: Source, gold: number | null, baht: number | null, createdBy: string | null) {
-  const { data, error } = await client.from('price_reports').insert({ item_id: itemId, source: source.toLowerCase(), gold_price: gold, baht_price: baht, status: 'pending', created_by: createdBy }).select('id').single();
+  const { data, error } = await client.from('price_reports').insert({ id: randomUUID(), item_id: itemId, source: source.toLowerCase(), gold_price: gold, baht_price: baht, status: 'pending', created_by: createdBy }).select('id').single();
   if (error) throw error;
   return String(data.id);
 }
