@@ -41,6 +41,9 @@ create unique index if not exists admins_username_unique on public.admins (lower
 
 -- Reports use these values; prices can be NULL when only the other currency
 -- was provided. That lets the app convert dynamically using the current rate.
+alter table public.price_reports alter column id set default gen_random_uuid();
+alter table public.price_reports alter column reviewed_by drop not null;
+alter table public.price_reports alter column created_at set default now();
 alter table public.price_reports enable row level security;
 alter table public.item enable row level security;
 alter table public.market_settings enable row level security;
