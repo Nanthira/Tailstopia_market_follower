@@ -1,6 +1,8 @@
 -- Run this in Supabase SQL Editor after creating the tables shown in your diagram.
 -- The app expects these exact table/column names and stores no seller identity.
 
+create extension if not exists pgcrypto with schema extensions;
+
 -- The price-report foreign keys point to the item and admin tables.
 do $$
 declare wrong_fk record;

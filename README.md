@@ -7,7 +7,7 @@ A TypeScript, React, and Node.js site for browsing item prices and moderating re
 1. Copy `.env.example` to `.env`.
 2. In Supabase, open **Connect to your project** and copy the project URL and keys into `.env`. Fill in `SUPABASE_URL` and `SUPABASE_SECRET_KEY`; keep the secret key on the Node server only. `SUPABASE_PUBLISHABLE_KEY` and `SUPABASE_JWKS_URL` are included to match the connection panel, but this Express app does not need them for its custom username/password admin login.
 3. Run `supabase/setup.sql` in the Supabase SQL Editor. It enables RLS, adds the expected foreign keys and unique admin usernames, and creates the public `item-images` Storage bucket. Review the diagram's relationships: `price_reports.item_id → item.id`, report `created_by` and `reviewed_by` → `admins.id`, and `market_settings.updated_by → admins.id`.
-4. In `admins`, add your own two rows with unique usernames, bcrypt password hashes, and `is_active = true`. There is no registration page. Generate each hash using `npm run admin:hash` and paste the result into `password_hash`.
+4. In `admins`, add your own two rows with unique usernames and `is_active = true`. There is no registration page. Use `supabase/create_admin.sql`; Postgres hashes the supplied password with pgcrypto's bcrypt function. The password appears as text in the SQL query, so don't save, commit, or share that completed query. Alternatively, generate a hash locally with `npm run admin:hash` and insert only the hash.
 5. Set `DISCORD_BOT_SECRET` to a private random value. Give that same value only to your private Discord bot.
 6. Run `npm install`, then `npm run dev`, and open the address printed by the server.
 
