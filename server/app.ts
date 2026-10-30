@@ -77,9 +77,10 @@ function sendDbError(res: express.Response, error: unknown) {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'TailsTopia Market', databaseConfigured: !!supabase }));
 
-app.get('/api/listings', async (_req, res) => {
+app.get('/api/listings', async (req, res) => {
   const client = db(res); if (!client) return;
   try {
+    const admin = await currentAdmin(req);
     const [itemResult, reportResult, rate] = await Promise.all([
       client.from('item').select('id, name, category, description, image_path, created_at, updated_at').order('name'),
       client.from('price_reports').select('id, item_id, source, gold_price, baht_price, status, created_at'),
@@ -94,7 +95,8 @@ app.get('/api/listings', async (_req, res) => {
         id: String(item.id), name: item.name, category: item.category || 'Other',
         image: item.image_path || '', description: item.description || item.name,
         reports: related.filter((row: any) => row.status === 'approved').map((row: any) => reportFromRow(row, rate)),
-        pending: related.filter((row: any) => row.status === 'pending').map((row: any) => reportFromRow(row, rate)),
+        hasPending: related.some((row: any) => row.status === 'pending'),
+        pending: admin ? related.filter((row: any) => row.status === 'pending').map((row: any) => reportFromRow(row, rate)) : [],
       };
     }));
   } catch (error) { sendDbError(res, error); }

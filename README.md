@@ -15,9 +15,11 @@ A TypeScript, React, and Node.js site for browsing item prices and moderating re
 
 ## Deploy from GitHub to Netlify
 
-The repository includes `netlify.toml` and an Express Netlify Function for the `/api/*` routes. In Netlify, choose **Add new project → Import an existing project**, select this GitHub repository, and keep the build command as `npm run build` and publish directory as `dist` (both are set in `netlify.toml`). In **Project configuration → Environment variables**, add `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and `DISCORD_BOT_SECRET`; make sure the variables are available to Functions, then trigger a deploy. Netlify builds do not read `.env` from Git, so enter the values in Netlify's UI. With continuous deployment enabled, later GitHub pushes trigger a new deploy.
+The repository includes `netlify.toml` and an Express Netlify Function for the `/api/*` routes. In Netlify, choose **Add new project → Import an existing project**, select this GitHub repository, and keep the build command as `npm run build` and publish directory as `dist` (both are set in `netlify.toml`). In **Project configuration → Environment variables**, add `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, and `DISCORD_BOT_SECRET` for Functions. Also add `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` for Builds; these public values let the browser subscribe to the safe market-change signal. Netlify builds do not read `.env` from Git, so enter the values in Netlify's UI. With continuous deployment enabled, later GitHub pushes trigger a new deploy.
 
 Do not create a `VITE_` or `NEXT_PUBLIC_` version of `SUPABASE_SECRET_KEY`. The publishable key and JWKS URL are not currently needed by this server-side API. Locally, use `.env`; on Netlify, set the same server values in the Netlify environment-variable settings.
+
+The browser loads the notebook once, then listens to the Supabase Realtime `market_events` revision row. Database triggers update that row when items, prices, or the conversion rate change. The browser then re-fetches the API once; it also refreshes when a background tab becomes active to recover from missed WebSocket messages. Run the updated `supabase/setup.sql` in SQL Editor to create the RLS-protected signal table, publication entry, and triggers. The signal contains no item or report details. This replaces the previous five-second API polling.
 
 ## Tables used
 

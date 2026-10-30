@@ -54,3 +54,60 @@ alter table public.admins enable row level security;
 insert into storage.buckets (id, name, public)
 values ('item-images', 'item-images', true)
 on conflict (id) do update set public = true;
+
+-- Realtime sends a tiny revision signal when public or pending market data
+-- changes. The browser then re-fetches through the API; no report data is
+-- broadcast directly to public clients.
+create table if not exists public.market_events (
+  id smallint primary key check (id = 1),
+  revision bigint not null default 0,
+  changed_at timestamptz not null default now()
+);
+insert into public.market_events (id, revision)
+values (1, 0)
+on conflict (id) do nothing;
+alter table public.market_events enable row level security;
+grant select on public.market_events to anon, authenticated;
+drop policy if exists public_read_market_revision on public.market_events;
+create policy public_read_market_revision on public.market_events
+  for select to anon, authenticated using (true);
+
+create or replace function public.bump_market_revision()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  update public.market_events
+  set revision = revision + 1, changed_at = clock_timestamp()
+  where id = 1;
+  return null;
+end;
+$$;
+
+drop trigger if exists item_market_revision on public.item;
+create trigger item_market_revision
+  after insert or update or delete on public.item
+  for each statement execute function public.bump_market_revision();
+
+drop trigger if exists report_market_revision on public.price_reports;
+create trigger report_market_revision
+  after insert or update or delete on public.price_reports
+  for each statement execute function public.bump_market_revision();
+
+drop trigger if exists settings_market_revision on public.market_settings;
+create trigger settings_market_revision
+  after insert or update or delete on public.market_settings
+  for each statement execute function public.bump_market_revision();
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public' and tablename = 'market_events'
+  ) then
+    alter publication supabase_realtime add table public.market_events;
+  end if;
+end $$;
