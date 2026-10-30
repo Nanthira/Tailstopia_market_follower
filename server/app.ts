@@ -81,6 +81,7 @@ app.get('/api/listings', async (req, res) => {
   const client = db(res); if (!client) return;
   try {
     const admin = await currentAdmin(req);
+    if (req.header('authorization') && !admin) return res.status(401).json({ error: 'Admin session expired. Please log in again.' });
     const [itemResult, reportResult, rate] = await Promise.all([
       client.from('item').select('id, name, category, description, image_path, created_at, updated_at').order('name'),
       client.from('price_reports').select('id, item_id, source, gold_price, baht_price, status, created_at'),
@@ -91,12 +92,13 @@ app.get('/api/listings', async (req, res) => {
     const reports = reportResult.data ?? [];
     res.json((itemResult.data ?? []).map((item: any) => {
       const related = reports.filter((row: any) => String(row.item_id) === String(item.id));
+      const isStatus = (row: any, value: string) => String(row.status).toLowerCase() === value;
       return {
         id: String(item.id), name: item.name, category: item.category || 'Other',
         image: item.image_path || '', description: item.description || item.name,
-        reports: related.filter((row: any) => row.status === 'approved').map((row: any) => reportFromRow(row, rate)),
-        hasPending: related.some((row: any) => row.status === 'pending'),
-        pending: admin ? related.filter((row: any) => row.status === 'pending').map((row: any) => reportFromRow(row, rate)) : [],
+        reports: related.filter((row: any) => isStatus(row, 'approved')).map((row: any) => reportFromRow(row, rate)),
+        hasPending: related.some((row: any) => isStatus(row, 'pending')),
+        pending: admin ? related.filter((row: any) => isStatus(row, 'pending')).map((row: any) => reportFromRow(row, rate)) : [],
       };
     }));
   } catch (error) { sendDbError(res, error); }
@@ -234,11 +236,11 @@ app.post('/api/review/:itemId', async (req, res) => {
   const { decision, reportId, source } = req.body ?? {};
   if (decision !== 'approve' && decision !== 'reject') return res.status(400).json({ error: 'Decision must be approve or reject.' });
   try {
-    let query = client.from('price_reports').select('id').eq('item_id', req.params.itemId).eq('status', 'pending');
-    if (source === 'Admin' || source === 'Bot') query = query.eq('source', source.toLowerCase());
+    let query = client.from('price_reports').select('id, source, status').eq('item_id', req.params.itemId);
     if (reportId) query = query.eq('id', reportId);
-    const { data: pending, error: findError } = await query;
+    const { data: found, error: findError } = await query;
     if (findError) throw findError;
+    const pending = (found ?? []).filter((row: any) => String(row.status).toLowerCase() === 'pending' && (!(source === 'Admin' || source === 'Bot') || String(row.source).toLowerCase() === source.toLowerCase()));
     if (!pending?.length) return res.status(400).json({ error: 'No pending submissions in this queue.' });
     const ids = pending.map((row: any) => row.id);
     const update = decision === 'approve'
