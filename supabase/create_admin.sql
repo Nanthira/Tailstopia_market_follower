@@ -11,3 +11,10 @@ values (
   now(),
   true
 );
+
+-- To reset an existing admin instead of creating a new row, comment out the
+-- INSERT above and use this UPDATE (replace both placeholders):
+-- update public.admins
+-- set password_hash = extensions.crypt('REPLACE_WITH_NEW_LONG_PASSWORD', extensions.gen_salt('bf', 12)),
+--     is_active = true
+-- where username = 'EXISTING_USERNAME';
