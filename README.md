@@ -1,56 +1,63 @@
-# TailsTopia community market demo
+# TailsTopia market notebook
 
-A TypeScript, React and Node.js prototype for a community price notebook inspired by [the 12 Tails item archive](https://12tails-items.netlify.app/). Members can browse only. Price reports enter in two ways: an admin can enter one manually, or an authenticated Discord bot can forward one. The admin dashboard separates reports into Admin request and Bot request sections, grouped by item.
+A TypeScript, React, and Node.js site for browsing item prices and moderating reports. Data is stored in your Supabase project. Reports are added by an admin through the website or by the private Discord bot. Seller names and seller accounts are not collected or stored.
 
-## Run locally
+## Connect your Supabase project
 
-1. Install Node.js 20 or newer.
-2. Run `npm install` in this folder.
-3. Run `npm run dev`.
-4. Open the local address printed by the server (usually `http://localhost:3001`).
+1. Copy `.env.example` to `.env`.
+2. In Supabase, open **Connect to your project** and copy the project URL and keys into `.env`. Fill in `SUPABASE_URL` and `SUPABASE_SECRET_KEY`; keep the secret key on the Node server only. `SUPABASE_PUBLISHABLE_KEY` and `SUPABASE_JWKS_URL` are included to match the connection panel, but this Express app does not need them for its custom username/password admin login.
+3. Run `supabase/setup.sql` in the Supabase SQL Editor. It enables RLS, adds the expected foreign keys and unique admin usernames, and creates the public `item-images` Storage bucket. Review the diagram's relationships: `price_reports.item_id → item.id`, report `created_by` and `reviewed_by` → `admins.id`, and `market_settings.updated_by → admins.id`.
+4. In `admins`, add your own two rows with unique usernames, bcrypt password hashes, and `is_active = true`. There is no registration page. Generate each hash using `npm run admin:hash` and paste the result into `password_hash`.
+5. Set `DISCORD_BOT_SECRET` to a private random value. Give that same value only to your private Discord bot.
+6. Run `npm install`, then `npm run dev`, and open the address printed by the server.
 
-The seeded catalog is sample data for the demo. Approved card prices show the minimum and maximum approved report and the most frequently submitted value for both Gold and baht. When multiple prices tie as the most common, the card shows the lowest tied price. Reports with only one currency automatically convert using the rate set in the admin dashboard. Reports that include both currencies preserve both entered amounts. Data and the selected rate are kept in memory and reset when the server restarts.
+`SUPABASE_SECRET_KEY` is used only by the Express backend for database and Storage requests. Never add it to React/Vite variables, browser code, screenshots, or GitHub. The keys in `.env` are ignored by Git. The app uses `@supabase/supabase-js` because this Express backend handles its own username/password sessions; `@supabase/server` is intended for request-scoped Supabase JWT authentication in supported runtimes.
 
-The demo has an admin login. Use **admin** / **tailstopia-demo**. Set `DEMO_ADMIN_PASSWORD` in the server environment to change the demo password. Admins can configure an item's name, category, description, and image from its card. Image uploads accept PNG, JPG, WEBP, and GIF files up to 5 MB and are stored in `public/uploads`. Sessions are in memory and sign out when the server restarts; use real user storage and authentication before production.
+## Tables used
 
-## Discord bridge
+- `item`: `id`, `name`, `category`, `description`, `image_path`, `created_at`, `updated_at`
+- `price_reports`: `id`, `item_id`, `source`, `gold_price`, `baht_price`, `status`, `created_at`, `reviewed_by`, `reviewed_at`, `created_by`
+- `admins`: `id`, `username`, `password_hash`, `created_at`, `is_active`
+- `market_settings`: `id`, `baht_per_1000_gold`, `updated_by`, `updated_at`
 
-The demo includes an intake endpoint at `POST /api/listings/intake`. The intended bot deployment is in your private server, listening only to the configured channel where an admin forwards posts from the main Tailstopia server. It parses the forwarded item name and prices, then POSTs the report to this endpoint with a bearer secret. Each bot report appears under **Bot request**. Admin manual entries appear under **Admin request**. Both sections group by item; each group can be approved all at once, or one report at a time. Empty source sections are hidden.
+When only one currency is submitted, the other price stays SQL `NULL` and is converted for display using the current rate. If both currencies are submitted, both recorded prices are used as entered. No seller column or seller name is used.
 
-For local development, set a server-side secret in PowerShell before starting the app:
+## Discord bot bridge
 
-```powershell
-$env:DISCORD_BOT_SECRET = "your-local-demo-secret"
-npm run dev
-```
-
-Example request body:
+`POST /api/listings/intake` accepts bot submissions and puts them in the Bot pending queue. The bot should listen only to the private channel where you forward market messages, parse the item and one or both prices, then send JSON with `Authorization: Bearer <DISCORD_BOT_SECRET>`. Example body:
 
 ```json
 {
   "itemName": "Zerarite",
   "category": "Material",
-  "seller": "Forwarded by admin",
   "gold": 2000,
   "baht": null,
   "description": "Forwarded market post"
 }
 ```
 
-Send it with `Authorization: Bearer your-local-demo-secret`. If `DISCORD_BOT_SECRET` is missing or does not match, the intake endpoint rejects the request. The admin login uses an in-memory demo session. For production, add durable storage, production-grade authentication, image upload/storage, channel allow-listing and message validation in the bot, and rotateable service credentials. Never put a Discord bot token or the bridge secret in browser code.
+The API intentionally ignores any seller fields. Admin-created prices enter the separate Admin pending queue. Approving a group updates the selected reports to `approved`; rejecting marks them `rejected`. The public cards show only approved prices.
+
+## Run and build
+
+```powershell
+npm install
+npm run dev
+```
+
+```powershell
+npm run build
+```
 
 ## API
 
-- `GET /api/health` — service status
-- `GET /api/listings` — seeded items, approved reports, and pending reports
-- `GET /api/settings` — current Gold-to-baht conversion rate
-- `PUT /api/settings/rate` — change `bahtPer1000Gold`; requires the admin bearer session
-- `POST /api/uploads/image` — upload an image as a base64 data URL; requires the admin bearer session
-- `PUT /api/items/:itemId` — update the item's name, category, description, and uploaded image; requires the admin bearer session
-- `POST /api/auth/login` — demo admin login; returns an in-memory bearer session token
-- `POST /api/auth/logout` — expire the current in-memory demo session
-- `POST /api/submissions` — admin manual entry; requires the admin bearer session; it creates an Admin request
-- `POST /api/listings/intake` — bot report; requires `Authorization: Bearer <DISCORD_BOT_SECRET>`; it creates a Bot request
-- `POST /api/review/:itemId` with the admin bearer session and `source: "Admin"` or `source: "Bot"` to approve or reject that item's source-specific queue; pass `reportId` to moderate one report
-
-The editable Gold/baht rate and item reports live in server memory for demo purposes; they reset when the server restarts.
+- `GET /api/health` — service and Supabase connection status
+- `GET /api/listings` — items with approved and pending reports
+- `GET /api/settings` — Gold/baht conversion rate
+- `PUT /api/settings/rate` — update the rate; admin bearer session required
+- `POST /api/uploads/image` — save to Supabase Storage; admin bearer session required
+- `PUT /api/items/:itemId` — configure item; admin bearer session required
+- `POST /api/auth/login` and `/api/auth/logout` — admin login using `admins.username` and bcrypt `password_hash`
+- `POST /api/submissions` — create an Admin pending report; admin bearer session required
+- `POST /api/listings/intake` — create a Bot pending report; Discord bridge secret required
+- `POST /api/review/:itemId` — approve or reject one report or all pending reports for an item/source; admin bearer session required
