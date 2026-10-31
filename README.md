@@ -6,7 +6,7 @@ A TypeScript, React, and Node.js site for browsing item prices and moderating re
 
 1. Copy `.env.example` to `.env`.
 2. In Supabase, open **Connect to your project** and copy the project URL and keys into `.env`. Fill in `SUPABASE_URL` and `SUPABASE_SECRET_KEY`; keep the secret key on the Node server only. `SUPABASE_PUBLISHABLE_KEY` and `SUPABASE_JWKS_URL` are included to match the connection panel, but this Express app does not need them for its custom username/password admin login.
-3. Run `supabase/setup.sql` in the Supabase SQL Editor. It enables RLS, adds the expected foreign keys and unique admin usernames, and creates the public `item-images` Storage bucket. Review the diagram's relationships: `price_reports.item_id → item.id`, report `created_by` and `reviewed_by` → `admins.id`, and `market_settings.updated_by → admins.id`.
+3. Run the latest `supabase/setup.sql` in the Supabase SQL Editor before running this version. It enables RLS, adds the expected foreign keys and unique admin usernames, adds `item.deleted_at` for the recoverable Trash, and creates the public `item-images` Storage bucket. Review the diagram relationships: `price_reports.item_id → item.id`, report `created_by` and `reviewed_by` → `admins.id`, and `market_settings.updated_by` → `admins.id`.
 4. In `admins`, add your own two rows with unique usernames and `is_active = true`. There is no registration page. Use `supabase/create_admin.sql`; Postgres hashes the supplied password with pgcrypto's bcrypt function. The password appears as text in the SQL query, so don't save, commit, or share that completed query. Alternatively, generate a hash locally with `npm run admin:hash` and insert only the hash.
 5. Set `DISCORD_BOT_SECRET` to a private random value. Give that same value only to your private Discord bot.
 6. Run `npm install`, then `npm run dev`, and open the address printed by the server.
@@ -23,12 +23,15 @@ The browser loads the notebook once, then listens to the Supabase Realtime `mark
 
 ## Tables used
 
-- `item`: `id`, `name`, `category`, `description`, `image_path`, `created_at`, `updated_at`
+- `item`: `id`, `name`, `category`, `description`, `image_path`, `created_at`, `updated_at`, `deleted_at`
 - `price_reports`: `id`, `item_id`, `source`, `gold_price`, `baht_price`, `status`, `created_at`, `reviewed_by`, `reviewed_at`, `created_by`
 - `admins`: `id`, `username`, `password_hash`, `created_at`, `is_active`
 - `market_settings`: `id`, `baht_per_1000_gold`, `updated_by`, `updated_at`
 
 When only one currency is submitted, the other price stays SQL `NULL` and is converted for display using the current rate. If both currencies are submitted, both recorded prices are used as entered. No seller column or seller name is used.
+Public cards and current price counts use only approved reports. Removing a report changes its status to `removed`; its original row remains in history and does not count toward the market range or common price. Submitting that same price again creates a separate report that counts only after it is approved.
+
+Admins can move an item card into Trash and restore it for three days. Expired items are permanently removed the next time an admin opens or refreshes listings or Trash. Permanent purge removes the item's reports by the existing cascading foreign key and removes its image only when the URL belongs to this project's public `item-images` bucket. New image uploads are resized to at most 1200 pixels on the longest edge and converted to WebP at quality 0.80 in the browser. Existing stored images are unchanged.
 
 ## Discord bot bridge
 
@@ -61,10 +64,15 @@ npm run build
 
 - `GET /api/health` — service and Supabase connection status
 - `GET /api/listings` — items with approved and pending reports
+- `GET /api/trash` — admin Trash items; also purges expired items
 - `GET /api/settings` — Gold/baht conversion rate
 - `PUT /api/settings/rate` — update the rate; admin bearer session required
 - `POST /api/uploads/image` — save to Supabase Storage; admin bearer session required
 - `PUT /api/items/:itemId` — configure item; admin bearer session required
+- `DELETE /api/items/:itemId` — move item to Trash; admin bearer session required
+- `POST /api/trash/:itemId/restore` — restore an item within three days; admin bearer session required
+- `DELETE /api/trash/:itemId` — permanently delete a trashed item and its owned image; admin bearer session required
+- `DELETE /api/reports/:reportId` — remove a pending/approved report from active market prices while retaining history; admin bearer session required
 - `POST /api/auth/login` and `/api/auth/logout` — admin login using `admins.username` and bcrypt `password_hash`
 - `POST /api/submissions` — create an Admin pending report; admin bearer session required
 - `POST /api/listings/intake` — create a Bot pending report; Discord bridge secret required

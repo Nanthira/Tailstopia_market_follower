@@ -54,12 +54,15 @@ function reportFromRow(row: any, rate: number) {
   const bahtEntered = baht !== null;
   return {
     id: String(row.id),
+    goldPrice: gold,
+    bahtPrice: baht,
     gold: gold ?? (baht! * 1000 / rate),
     baht: baht ?? (gold! * rate / 1000),
     goldEntered,
     bahtEntered,
     submittedAt: new Date(row.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }),
     source: String(row.source).toLowerCase() === 'bot' ? 'Bot' as const : 'Admin' as const,
+    status: String(row.status).toLowerCase(),
   };
 }
 
@@ -75,6 +78,36 @@ function sendDbError(res: express.Response, error: unknown) {
   res.status(500).json({ error: 'Database request failed. Check the Supabase table names, columns, and permissions.' });
 }
 
+function itemImageObjectKey(imageUrl: unknown): string | null {
+  if (typeof imageUrl !== 'string' || !supabaseUrl) return null;
+  try {
+    const image = new URL(imageUrl);
+    const project = new URL(supabaseUrl);
+    const prefix = '/storage/v1/object/public/item-images/';
+    if (image.origin !== project.origin || !image.pathname.startsWith(prefix)) return null;
+    const key = decodeURIComponent(image.pathname.slice(prefix.length));
+    if (!key || key.includes('/') || key === '.' || key === '..') return null;
+    return key;
+  } catch { return null; }
+}
+
+async function purgeItem(client: SupabaseClient, item: { id: number | string; image_path?: string | null }) {
+  const key = itemImageObjectKey(item.image_path);
+  if (key) {
+    const { error } = await client.storage.from('item-images').remove([key]);
+    if (error) throw error;
+  }
+  const { error } = await client.from('item').delete().eq('id', String(item.id));
+  if (error) throw error;
+}
+
+async function purgeExpiredTrash(client: SupabaseClient) {
+  const expiredAt = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await client.from('item').select('id, image_path').not('deleted_at', 'is', null).lte('deleted_at', expiredAt);
+  if (error) throw error;
+  for (const item of data ?? []) await purgeItem(client, item);
+}
+
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'TailsTopia Market', databaseConfigured: !!supabase }));
 
 app.get('/api/listings', async (req, res) => {
@@ -82,9 +115,10 @@ app.get('/api/listings', async (req, res) => {
   try {
     const admin = await currentAdmin(req);
     if (req.header('authorization') && !admin) return res.status(401).json({ error: 'Admin session expired. Please log in again.' });
+    if (admin) await purgeExpiredTrash(client);
     const [itemResult, reportResult, rate] = await Promise.all([
-      client.from('item').select('id, name, category, description, image_path, created_at, updated_at').order('name'),
-      client.from('price_reports').select('id, item_id, source, gold_price, baht_price, status, created_at'),
+      client.from('item').select('id, name, category, description, image_path, created_at, updated_at').is('deleted_at', null).order('name'),
+      client.from('price_reports').select('id, item_id, source, gold_price, baht_price, status, created_at').order('created_at', { ascending: false }),
       getRate(client),
     ]);
     if (itemResult.error) throw itemResult.error;
@@ -99,8 +133,76 @@ app.get('/api/listings', async (req, res) => {
         reports: related.filter((row: any) => isStatus(row, 'approved')).map((row: any) => reportFromRow(row, rate)),
         hasPending: related.some((row: any) => isStatus(row, 'pending')),
         pending: admin ? related.filter((row: any) => isStatus(row, 'pending')).map((row: any) => reportFromRow(row, rate)) : [],
+        history: admin ? related.map((row: any) => reportFromRow(row, rate)) : [],
       };
     }));
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.get('/api/trash', async (req, res) => {
+  const client = db(res); if (!client) return;
+  if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
+  try {
+    await purgeExpiredTrash(client);
+    const { data, error } = await client.from('item').select('id, name, category, description, image_path, deleted_at').not('deleted_at', 'is', null).order('deleted_at', { ascending: false });
+    if (error) throw error;
+    res.json((data ?? []).map((item: any) => ({ id: String(item.id), name: item.name, category: item.category || 'Other', description: item.description || item.name, image: item.image_path || '', deletedAt: item.deleted_at })));
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.delete('/api/reports/:reportId', async (req, res) => {
+  const client = db(res); if (!client) return;
+  if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
+  try {
+    const { data: report, error: findError } = await client.from('price_reports').select('id, status').eq('id', req.params.reportId).maybeSingle();
+    if (findError) throw findError;
+    const status = String(report?.status || '').toLowerCase();
+    if (!report) return res.status(404).json({ error: 'Price report not found.' });
+    if (status !== 'pending' && status !== 'approved') return res.status(409).json({ error: 'Only pending or approved reports can be removed.' });
+    const { error } = await client.from('price_reports').update({ status: 'removed' }).eq('id', req.params.reportId);
+    if (error) throw error;
+    res.json({ ok: true, status: 'removed' });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.delete('/api/items/:itemId', async (req, res) => {
+  const client = db(res); if (!client) return;
+  if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
+  try {
+    const { data, error } = await client.from('item').update({ deleted_at: new Date().toISOString() }).eq('id', req.params.itemId).is('deleted_at', null).select('id').maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Active item not found.' });
+    res.json({ ok: true, trashed: true });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.post('/api/trash/:itemId/restore', async (req, res) => {
+  const client = db(res); if (!client) return;
+  if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
+  try {
+    const { data: item, error: findError } = await client.from('item').select('id, image_path, deleted_at').eq('id', req.params.itemId).not('deleted_at', 'is', null).maybeSingle();
+    if (findError) throw findError;
+    if (!item) return res.status(404).json({ error: 'Trashed item not found.' });
+    const expiredAt = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    if (new Date(item.deleted_at).getTime() <= expiredAt) {
+      await purgeItem(client, item);
+      return res.status(410).json({ error: 'The three-day recovery period has ended; this item was permanently deleted.' });
+    }
+    const { error } = await client.from('item').update({ deleted_at: null, updated_at: new Date().toISOString() }).eq('id', req.params.itemId);
+    if (error) throw error;
+    res.json({ ok: true, restored: true });
+  } catch (error) { sendDbError(res, error); }
+});
+
+app.delete('/api/trash/:itemId', async (req, res) => {
+  const client = db(res); if (!client) return;
+  if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
+  try {
+    const { data: item, error: findError } = await client.from('item').select('id, image_path').eq('id', req.params.itemId).not('deleted_at', 'is', null).maybeSingle();
+    if (findError) throw findError;
+    if (!item) return res.status(404).json({ error: 'Trashed item not found.' });
+    await purgeItem(client, item);
+    res.json({ ok: true, deleted: true });
   } catch (error) { sendDbError(res, error); }
 });
 
@@ -130,11 +232,11 @@ app.post('/api/uploads/image', async (req, res) => {
   const client = db(res); if (!client) return;
   if (!await currentAdmin(req)) return res.status(401).json({ error: 'Admin login required.' });
   const dataUrl = String(req.body?.dataUrl || '');
-  const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$/);
-  if (!match) return res.status(400).json({ error: 'Choose a PNG, JPG, WEBP, or GIF image.' });
+  const match = dataUrl.match(/^data:(image\/webp);base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return res.status(400).json({ error: 'Upload a resized WebP image.' });
   const bytes = Buffer.from(match[2], 'base64');
   if (!bytes.length || bytes.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'Image must be smaller than 5 MB.' });
-  const extension = match[1] === 'image/jpeg' ? 'jpg' : match[1].split('/')[1];
+  const extension = 'webp';
   const filename = `${randomBytes(12).toString('hex')}.${extension}`;
   try {
     const { error } = await client.storage.from('item-images').upload(filename, bytes, { contentType: match[1], upsert: false });
@@ -178,11 +280,11 @@ app.post('/api/auth/logout', (req, res) => {
 
 async function findOrCreateItem(client: SupabaseClient, itemId: unknown, name: string, category: string, image: string, description: string) {
   if (itemId !== undefined && itemId !== null && String(itemId).trim()) {
-    const { data, error } = await client.from('item').select('id, name, category, image_path, description').eq('id', String(itemId)).maybeSingle();
+    const { data, error } = await client.from('item').select('id, name, category, image_path, description').eq('id', String(itemId)).is('deleted_at', null).maybeSingle();
     if (error) throw error;
     if (data) return data;
   }
-  const { data: existing, error: findError } = await client.from('item').select('id, name, category, image_path, description').ilike('name', name).maybeSingle();
+  const { data: existing, error: findError } = await client.from('item').select('id, name, category, image_path, description').ilike('name', name).is('deleted_at', null).maybeSingle();
   if (findError) throw findError;
   if (existing) return existing;
   const { data, error } = await client.from('item').insert({ name, category: category || 'Other', image_path: image || '', description: description || name }).select('id, name, category, image_path, description').single();

@@ -16,7 +16,19 @@ begin
   loop
     execute format('alter table public.market_settings drop constraint %I', wrong_fk.conname);
   end loop;
-  if not exists (select 1 from pg_constraint where conname = 'price_reports_item_id_fkey') then
+  if not exists (
+    select 1 from pg_constraint
+    where conrelid = 'public.price_reports'::regclass
+      and confrelid = 'public.item'::regclass
+      and contype = 'f' and confdeltype = 'c'
+  ) then
+    for wrong_fk in
+      select conname from pg_constraint
+      where conrelid = 'public.price_reports'::regclass
+        and confrelid = 'public.item'::regclass and contype = 'f'
+    loop
+      execute format('alter table public.price_reports drop constraint %I', wrong_fk.conname);
+    end loop;
     alter table public.price_reports add constraint price_reports_item_id_fkey
       foreign key (item_id) references public.item(id) on delete cascade;
   end if;
@@ -41,6 +53,9 @@ create unique index if not exists admins_username_unique on public.admins (lower
 
 -- Reports use these values; prices can be NULL when only the other currency
 -- was provided. That lets the app convert dynamically using the current rate.
+-- Items are soft-deleted into a recoverable admin Trash before permanent purge.
+alter table public.item add column if not exists deleted_at timestamptz;
+
 alter table public.price_reports alter column id set default gen_random_uuid();
 alter table public.price_reports alter column reviewed_by drop not null;
 alter table public.price_reports alter column created_at set default now();
